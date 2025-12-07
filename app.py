@@ -11,7 +11,6 @@ import datetime
 import time
 import threading
 from flask import Flask, jsonify, request
-from flask_cors import CORS
 import logging
 
 # सेटअप लॉगिंग
@@ -19,7 +18,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
 
 # ग्लोबल व्हेरिएबल्स
 TRADING_START_TIME = datetime.time(9, 25)  # सकाळी 9:25
@@ -31,15 +29,11 @@ MAX_LOSS_PERCENTAGE = 20
 class TradingState:
     def __init__(self):
         self.daily_trade_count = 0
-        self.total_capital = 100000  # डिफॉल्ट कॅपिटल (तुम्ही बदलू शकता)
+        self.total_capital = 100000  # डिफॉल्ट कॅपिटल
         self.current_loss = 0
-        self.trading_enabled = False
+        self.trading_enabled = True
         self.last_reset_date = datetime.date.today()
         self.trade_history = []
-        
-        # धन API क्रेडेंशियल्स (एन्वायरनमेंट व्हेरिएबल्समधून)
-        self.client_id = os.environ.get('DHAN_CLIENT_ID', '')
-        self.access_token = os.environ.get('DHAN_ACCESS_TOKEN', '')
         
         logger.info("📊 ट्रेडिंग स्टेट इनिशियलाइज्ड")
         logger.info(f"📈 ट्रेडिंग वेळ: {TRADING_START_TIME} ते {TRADING_END_TIME}")
@@ -56,6 +50,7 @@ def check_and_reset_daily_counter():
         trading_state.daily_trade_count = 0
         trading_state.last_reset_date = today
         trading_state.trade_history = []
+        trading_state.trading_enabled = True
         logger.info("🔄 दिवसाचा ट्रेड काउंटर रिसेट केला")
 
 def is_trading_time():
@@ -63,11 +58,12 @@ def is_trading_time():
     now = datetime.datetime.now().time()
     return TRADING_START_TIME <= now <= TRADING_END_TIME
 
-def calculate_loss_percentage(current_value):
+def calculate_loss_percentage():
     """तोटा टक्केवारी काढा"""
-    loss = trading_state.total_capital - current_value
-    loss_percentage = (loss / trading_state.total_capital) * 100
-    return max(0, loss_percentage)  # नेगेटिव्ह नाही
+    if trading_state.total_capital <= 0:
+        return 0
+    loss_percentage = (trading_state.current_loss / trading_state.total_capital) * 100
+    return max(0, loss_percentage)
 
 def can_place_trade():
     """ट्रेड घेण्यास परवानगी आहे का?"""
@@ -76,22 +72,24 @@ def can_place_trade():
     check_and_reset_daily_counter()
     
     # नियम 1: 20% तोटा तपासा
-    loss_percentage = calculate_loss_percentage(
-        trading_state.total_capital - trading_state.current_loss
-    )
+    loss_percentage = calculate_loss_percentage()
     
     if loss_percentage >= MAX_LOSS_PERCENTAGE:
         logger.warning(f"❌ 20% तोटा झाला आहे ({loss_percentage:.2f}%)")
         trading_state.trading_enabled = False
         return False, "20% तोटा झाला आहे. ट्रेडिंग बंद."
     
+    # ट्रेडिंग एनेबल तपासा
+    if not trading_state.trading_enabled:
+        return False, "ट्रेडिंग बंद केले आहे"
+    
     # नियम 2: ट्रेडिंग वेळ तपासा
     if not is_trading_time():
         current_time = datetime.datetime.now().time()
         if current_time < TRADING_START_TIME:
-            message = f"ट्रेडिंग अजून सुरू झाले नाही (9:25 AM पासून)"
+            message = "ट्रेडिंग अजून सुरू झाले नाही (9:25 AM पासून)"
         else:
-            message = f"ट्रेडिंग वेळ संपली (3:00 PM पर्यंत)"
+            message = "ट्रेडिंग वेळ संपली (3:00 PM पर्यंत)"
         logger.warning(f"⏰ {message}")
         return False, message
     
@@ -110,7 +108,6 @@ def auto_exit_at_3pm():
     if now >= exit_time and trading_state.trading_enabled:
         logger.info("🕒 3:00 PM झाली आहे, सर्व ट्रेड्स बंद करत आहे...")
         trading_state.trading_enabled = False
-        # इथे धन API वर एक्झिट ऑर्डर पाठवा
         return "सर्व ट्रेड्स 3:00 PM ला बंद केले"
     return None
 
@@ -122,12 +119,8 @@ def background_monitor():
             # 3 PM ऑटो एक्झिट
             auto_exit_at_3pm()
             
-            # ट्रेडिंग वेळ तपासा
-            if not is_trading_time():
-                trading_state.trading_enabled = False
-            
-            # 20 सेकंदांनी झोप
-            time.sleep(20)
+            # 30 सेकंदांनी झोप
+            time.sleep(30)
             
         except Exception as e:
             logger.error(f"मॉनिटरिंग एरर: {e}")
@@ -137,32 +130,66 @@ def background_monitor():
 @app.route('/')
 def home():
     """मुख्य पृष्ठ"""
-    return jsonify({
-        "अॅप": "धन रिस्क मॅनेजर",
-        "भाषा": "मराठी",
-        "स्थिती": "सक्रिय",
-        "नियम": [
-            "20% तोटा झाला की सर्व ट्रेड्स ऑटो एक्झिट",
-            "ट्रेड वेळ: सकाळी 9:25 ते दुपारी 3:00",
-            "दिवसात फक्त 10 ट्रेड्स"
-        ]
-    })
+    return """
+    <html>
+    <head>
+        <title>धन रिस्क मॅनेजर</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #2c3e50; }
+            .rule { background: #e8f4f8; padding: 15px; margin: 15px 0; border-left: 5px solid #3498db; border-radius: 5px; }
+            .status { padding: 10px; border-radius: 5px; font-weight: bold; }
+            .green { background: #d4edda; color: #155724; }
+            .red { background: #f8d7da; color: #721c24; }
+            .info { background: #d1ecf1; color: #0c5460; padding: 10px; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🪙 धन रिस्क मॅनेजर</h1>
+            <p><strong>स्थिती:</strong> <span class="status green">सक्रिय</span></p>
+            <p><strong>वेळ:</strong> """ + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
+            
+            <h2>📋 मुख्य नियम</h2>
+            <div class="rule">
+                <strong>नियम 1:</strong> 20% तोटा झाला की सर्व ट्रेड्स ऑटो एक्झिट
+            </div>
+            <div class="rule">
+                <strong>नियम 2:</strong> ट्रेड वेळ: सकाळी 9:25 ते दुपारी 3:00
+            </div>
+            <div class="rule">
+                <strong>नियम 3:</strong> दिवसात फक्त 10 ट्रेड्स
+            </div>
+            
+            <div class="info">
+                <p><strong>API एंडपॉइंट्स:</strong></p>
+                <ul>
+                    <li><code>/health</code> - हेल्थ चेक</li>
+                    <li><code>/can_trade</code> - ट्रेड परवानगी तपासा</li>
+                    <li><code>/get_state</code> - सर्व स्टेट माहिती</li>
+                </ul>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
-@app.route('/health')
+@app.route('/health', methods=['GET'])
 def health():
     """हेल्थ चेक"""
     can_trade, message = can_place_trade()
     
     return jsonify({
-        "स्थिती": "स्वस्थ",
-        "ट्रेडिंग_परवानगी": can_trade,
-        "संदेश": message,
-        "वेळ": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "आजचे_ट्रेड्स": trading_state.daily_trade_count,
-        "बाकी_ट्रेड्स": MAX_DAILY_TRADES - trading_state.daily_trade_count,
-        "ट्रेडिंग_वेळ": f"{TRADING_START_TIME} ते {TRADING_END_TIME}",
-        "कॅपिटल": trading_state.total_capital,
-        "सध्याचा_तोटा": f"{trading_state.current_loss} ({calculate_loss_percentage(trading_state.total_capital - trading_state.current_loss):.2f}%)"
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "trading_permission": can_trade,
+        "message": message,
+        "daily_trades": trading_state.daily_trade_count,
+        "remaining_trades": MAX_DAILY_TRADES - trading_state.daily_trade_count,
+        "trading_hours": f"{TRADING_START_TIME} to {TRADING_END_TIME}",
+        "loss_percentage": f"{calculate_loss_percentage():.2f}%"
     })
 
 @app.route('/can_trade', methods=['GET'])
@@ -171,11 +198,12 @@ def check_trade_permission():
     can_trade, message = can_place_trade()
     
     response = {
-        "परवानगी": can_trade,
-        "संदेश": message,
-        "ट्रेड_काउंट": trading_state.daily_trade_count,
-        "मॅक्स_ट्रेड्स": MAX_DAILY_TRADES,
-        "वेळ": datetime.datetime.now().strftime("%H:%M:%S")
+        "permission": can_trade,
+        "message": message,
+        "trade_count": trading_state.daily_trade_count,
+        "max_trades": MAX_DAILY_TRADES,
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "trading_hours_active": is_trading_time()
     }
     
     logger.info(f"ट्रेड परवानगी तपास: {response}")
@@ -185,22 +213,12 @@ def check_trade_permission():
 def place_order():
     """ऑर्डर प्लेस करा (सिम्युलेटेड)"""
     try:
-        data = request.json
-        symbol = data.get('symbol', '')
-        quantity = data.get('quantity', 0)
-        
-        if not symbol or quantity <= 0:
-            return jsonify({
-                "स्थिती": "अयशस्वी",
-                "संदेश": "चुकीचा डेटा"
-            }), 400
-        
         # ट्रेड परवानगी तपासा
         can_trade, message = can_place_trade()
         if not can_trade:
             return jsonify({
-                "स्थिती": "नकार",
-                "संदेश": message
+                "status": "declined",
+                "message": message
             }), 403
         
         # सिम्युलेटेड ऑर्डर
@@ -210,40 +228,39 @@ def place_order():
         trading_state.daily_trade_count += 1
         trading_state.trade_history.append({
             "order_id": order_id,
-            "symbol": symbol,
-            "quantity": quantity,
             "time": datetime.datetime.now().isoformat(),
-            "status": "प्लेस्ड"
+            "status": "placed"
         })
         
-        logger.info(f"✅ ऑर्डर प्लेस केला: {order_id} | सिम्बॉल: {symbol} | प्रमाण: {quantity}")
+        logger.info(f"✅ ऑर्डर प्लेस केला: {order_id}")
         
         return jsonify({
-            "स्थिती": "यशस्वी",
-            "संदेश": "ऑर्डर प्लेस केला",
-            "ऑर्डर_आयडी": order_id,
-            "आजचे_ट्रेड्स": trading_state.daily_trade_count,
-            "बाकी_ट्रेड्स": MAX_DAILY_TRADES - trading_state.daily_trade_count
+            "status": "success",
+            "message": "ऑर्डर प्लेस केला",
+            "order_id": order_id,
+            "daily_trades": trading_state.daily_trade_count,
+            "remaining_trades": MAX_DAILY_TRADES - trading_state.daily_trade_count
         })
         
     except Exception as e:
         logger.error(f"ऑर्डर एरर: {e}")
         return jsonify({
-            "स्थिती": "त्रुटी",
-            "संदेश": str(e)
+            "status": "error",
+            "message": str(e)
         }), 500
 
 @app.route('/update_loss', methods=['POST'])
 def update_loss():
     """तोटा अपडेट करा"""
     try:
-        data = request.json
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
         loss_amount = float(data.get('loss', 0))
         
         trading_state.current_loss = loss_amount
-        loss_percentage = calculate_loss_percentage(
-            trading_state.total_capital - loss_amount
-        )
+        loss_percentage = calculate_loss_percentage()
         
         logger.info(f"📉 तोटा अपडेट: ₹{loss_amount} ({loss_percentage:.2f}%)")
         
@@ -253,14 +270,14 @@ def update_loss():
             logger.warning(f"🚨 20% तोटा झाला! ट्रेडिंग बंद.")
         
         return jsonify({
-            "स्थिती": "यशस्वी",
-            "तोटा": loss_amount,
-            "तोटा_टक्के": f"{loss_percentage:.2f}%",
-            "ट्रेडिंग_स्टेटस": "सक्रिय" if trading_state.trading_enabled else "बंद"
+            "status": "success",
+            "loss": loss_amount,
+            "loss_percentage": f"{loss_percentage:.2f}%",
+            "trading_enabled": trading_state.trading_enabled
         })
         
     except Exception as e:
-        return jsonify({"त्रुटी": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/reset_daily', methods=['POST'])
 def reset_daily():
@@ -268,33 +285,35 @@ def reset_daily():
     trading_state.daily_trade_count = 0
     trading_state.trade_history = []
     trading_state.last_reset_date = datetime.date.today()
+    trading_state.trading_enabled = True
     
     logger.info("🔄 दिवसाचा काउंटर रिसेट केला")
     
     return jsonify({
-        "स्थिती": "यशस्वी",
-        "संदेश": "दिवसाचा काउंटर रिसेट केला",
-        "ट्रेड_काउंट": 0
+        "status": "success",
+        "message": "दिवसाचा काउंटर रिसेट केला",
+        "trade_count": 0
     })
 
-@app.route('/get_state')
+@app.route('/get_state', methods=['GET'])
 def get_state():
     """सर्व स्टेट माहिती मिळवा"""
     can_trade, message = can_place_trade()
     
     return jsonify({
-        "दिनांक": trading_state.last_reset_date.isoformat(),
-        "आजचे_ट्रेड्स": trading_state.daily_trade_count,
-        "मॅक्स_ट्रेड्स": MAX_DAILY_TRADES,
-        "बाकी_ट्रेड्स": MAX_DAILY_TRADES - trading_state.daily_trade_count,
-        "ट्रेडिंग_परवानगी": can_trade,
-        "संदेश": message,
-        "कॅपिटल": trading_state.total_capital,
-        "सध्याचा_तोटा": trading_state.current_loss,
-        "तोटा_टक्के": f"{calculate_loss_percentage(trading_state.total_capital - trading_state.current_loss):.2f}%",
-        "ट्रेडिंग_वेळ": is_trading_time(),
-        "वर्तमान_वेळ": datetime.datetime.now().strftime("%H:%M:%S"),
-        "ट्रेड_इतिहास": trading_state.trade_history[-5:]  # शेवटचे 5 ट्रेड्स
+        "date": trading_state.last_reset_date.isoformat(),
+        "daily_trades": trading_state.daily_trade_count,
+        "max_trades": MAX_DAILY_TRADES,
+        "remaining_trades": MAX_DAILY_TRADES - trading_state.daily_trade_count,
+        "trading_permission": can_trade,
+        "message": message,
+        "capital": trading_state.total_capital,
+        "current_loss": trading_state.current_loss,
+        "loss_percentage": f"{calculate_loss_percentage():.2f}%",
+        "trading_time_active": is_trading_time(),
+        "current_time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "trading_enabled": trading_state.trading_enabled,
+        "recent_trades": trading_state.trade_history[-5:]  # शेवटचे 5 ट्रेड्स
     })
 
 # सर्व्हर सुरू करताना
@@ -308,4 +327,5 @@ if __name__ == '__main__':
     logger.info(f"🎯 दिवसाचे कमाल ट्रेड्स: {MAX_DAILY_TRADES}")
     logger.info(f"⚠️ कमाल तोटा मर्यादा: {MAX_LOSS_PERCENTAGE}%")
     
-    app.run(host='0.0.0.0', port=10000, debug=False)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
