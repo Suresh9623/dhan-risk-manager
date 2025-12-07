@@ -1,194 +1,323 @@
 import os
 import time
-import requests
-import schedule
+import logging
 from datetime import datetime, time as dtime
-from flask import Flask
-from threading import Thread
+from flask import Flask, jsonify
+import threading
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Environment Variables (Render Dashboard वरून Set करायचे)
-DHAN_API_KEY = os.getenv("DHAN_API_KEY")
-CLIENT_ID = os.getenv("CLIENT_ID")
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
-WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER")
+# Environment Variables
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
+TWILIO_SID = os.getenv("TWILIO_SID", "")
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN", "")
+WHATSAPP_TO = os.getenv("WHATSAPP_TO", "")
 
-class DhanAutoRiskManager:
+# Global state
+monitoring_active = False
+start_balance = None
+orders_today = 0
+last_check = None
+
+class DhanManager:
     def __init__(self):
-        self.start_balance = None
-        self.order_counter = 0
-        self.trading_blocked = False
-        self.max_orders = 10
-        self.loss_limit = 0.20  # 20%
-        
-    def whatsapp_alert(self, message):
-        """WhatsApp Message पाठवणे"""
-        try:
-            from twilio.rest import Client
-            client = Client(TWILIO_SID, TWILIO_TOKEN)
-            client.messages.create(
-                body=f"⚠️ DHAN RISK MANAGER: {message}",
-                from_='whatsapp:+14155238886',
-                to=f'whatsapp:+91{WHATSAPP_NUMBER}'
-            )
-            print(f"WhatsApp Sent: {message}")
-        except Exception as e:
-            print(f"WhatsApp Error: {e}")
+        self.client = None
+        self.setup_dhan()
     
-    def get_dhan_balance(self):
-        """DHAN Balance Fetch"""
+    def setup_dhan(self):
+        """Initialize DHAN client"""
         try:
-            url = "https://api.dhan.co/balance"
-            headers = {"access-token": DHAN_API_KEY}
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("available_margin", 0)
+            from dhanhq import dhanhq
+            self.client = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+            logger.info("✅ DHAN Client initialized")
+            return True
+        except ImportError:
+            logger.error("❌ 'dhanhq' package not installed. Add 'dhanhq' to requirements.txt")
+            return False
         except Exception as e:
-            print(f"Balance Fetch Error: {e}")
+            logger.error(f"❌ DHAN Setup error: {e}")
+            return False
+    
+    def get_balance(self):
+        """Get available balance"""
+        try:
+            if self.client:
+                # DHAN balance API call
+                response = self.client.get_funds_limits()
+                if response and 'data' in response:
+                    return response['data'].get('availableMargin', 0)
+        except Exception as e:
+            logger.error(f"Balance error: {e}")
         return None
     
-    def get_dhan_positions(self):
-        """Open Positions Fetch"""
+    def get_positions(self):
+        """Get current positions"""
         try:
-            url = "https://api.dhan.co/positions"
-            headers = {"access-token": DHAN_API_KEY}
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
+            if self.client:
+                response = self.client.get_positions()
+                return response.get('data', [])
         except Exception as e:
-            print(f"Positions Error: {e}")
+            logger.error(f"Positions error: {e}")
         return []
     
-    def get_dhan_orders_today(self):
-        """Today's Orders Count"""
+    def get_today_orders(self):
+        """Get today's orders count"""
         try:
-            url = "https://api.dhan.co/orders"
-            headers = {"access-token": DHAN_API_KEY}
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                orders = response.json()
+            if self.client:
+                response = self.client.order_book()
+                orders = response.get('data', [])
                 today = datetime.now().date()
-                today_orders = [o for o in orders if 
-                              datetime.strptime(o["orderTimestamp"], "%Y-%m-%d %H:%M:%S").date() == today]
-                return len(today_orders)
+                
+                count = 0
+                for order in orders:
+                    order_time = datetime.strptime(
+                        order.get('orderTimestamp', '1970-01-01'), 
+                        '%Y-%m-%d %H:%M:%S'
+                    ).date()
+                    if order_time == today:
+                        count += 1
+                return count
         except Exception as e:
-            print(f"Orders Error: {e}")
+            logger.error(f"Orders error: {e}")
         return 0
     
-    def emergency_exit_all(self):
-        """सर्व Positions Exit"""
+    def square_off_all(self):
+        """Square off all positions"""
         try:
-            positions = self.get_dhan_positions()
-            headers = {"access-token": DHAN_API_KEY}
-            
+            positions = self.get_positions()
             for pos in positions:
-                if pos.get("netQty", 0) != 0:
-                    order_data = {
-                        "symbol": pos["symbol"],
-                        "exchange": pos["exchange"],
-                        "transactionType": "SELL" if pos["netQty"] > 0 else "BUY",
-                        "orderType": "MARKET",
-                        "quantity": abs(pos["netQty"]),
-                        "productType": "INTRADAY"
+                if pos.get('netQty', 0) != 0:
+                    # Market order to close
+                    order_args = {
+                        "transaction_type": self.client.SELL if pos['netQty'] > 0 else self.client.BUY,
+                        "exchange_segment": pos['exchangeSegment'],
+                        "product_type": self.client.INTRADAY,
+                        "order_type": self.client.MARKET,
+                        "quantity": abs(pos['netQty']),
+                        "security_id": str(pos['securityId'])
                     }
-                    requests.post("https://api.dhan.co/orders", 
-                                json=order_data, headers=headers, timeout=5)
-            
-            self.whatsapp_alert("🚨 EMERGENCY EXIT: All positions squared off")
-            self.trading_blocked = True
+                    self.client.place_order(**order_args)
+            return True
         except Exception as e:
-            print(f"Exit Error: {e}")
+            logger.error(f"Square-off error: {e}")
+            return False
+
+# Create instance
+dhan = DhanManager()
+
+def send_whatsapp_alert(message):
+    """Send WhatsApp notification"""
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        message = client.messages.create(
+            body=f"🛡️ DHAN Risk Manager: {message}",
+            from_='whatsapp:+14155238886',
+            to=f'whatsapp:+91{WHATSAPP_TO}'
+        )
+        logger.info(f"📱 WhatsApp sent: {message.body}")
+        return True
+    except Exception as e:
+        logger.error(f"WhatsApp error: {e}")
+        return False
+
+def monitor_market():
+    """Main monitoring function"""
+    global monitoring_active, start_balance, orders_today, last_check
     
-    def morning_routine(self):
-        """9:25 AM चे Daily Setup"""
-        if self.trading_blocked:
-            self.trading_blocked = False
-        
-        balance = self.get_dhan_balance()
-        if balance:
-            self.start_balance = balance
-            self.order_counter = 0
-            self.whatsapp_alert(f"🟢 Trading Started | Balance: ₹{balance}")
-    
-    def monitor_task(self):
-        """Main Monitoring Task (हर 30 सेकंद)"""
-        now = datetime.now()
-        current_time = now.time()
-        
-        # 1. Trading Hours Check (9:25 AM - 3:00 PM)
-        if current_time < dtime(9, 25) or current_time > dtime(15, 0):
-            return
-        
-        # 2. Morning Balance Capture (9:25 AM)
-        if current_time >= dtime(9, 25) and current_time <= dtime(9, 26):
-            if not self.start_balance:
-                self.morning_routine()
-        
-        # 3. Order Count Check
-        today_orders = self.get_dhan_orders_today()
-        if today_orders >= self.max_orders and not self.trading_blocked:
-            self.whatsapp_alert(f"📛 10/10 Orders Limit Reached! Trading Blocked")
-            self.trading_blocked = True
-        
-        # 4. Loss Limit Check (20%)
-        if self.start_balance and not self.trading_blocked:
-            positions = self.get_dhan_positions()
-            total_pnl = sum([pos.get("pnl", 0) for pos in positions])
+    while monitoring_active:
+        try:
+            now = datetime.now()
+            current_time = now.time()
+            last_check = now
             
-            if total_pnl < 0:
-                loss_percent = abs(total_pnl) / self.start_balance
-                if loss_percent >= self.loss_limit:
-                    self.whatsapp_alert(f"🚨 20% Loss Limit Hit! P&L: ₹{total_pnl}")
-                    self.emergency_exit_all()
-        
-        # 5. EOD Auto Exit (2:55 PM)
-        if current_time >= dtime(14, 55) and current_time <= dtime(14, 56):
-            positions = self.get_dhan_positions()
-            if positions:
-                self.whatsapp_alert("⏰ Market Closing - Auto Exit")
-                self.emergency_exit_all()
+            # 1. Check if within market hours (9:15 AM - 3:30 PM IST)
+            market_start = dtime(9, 15)  # 9:15 AM
+            market_end = dtime(15, 30)   # 3:30 PM
+            
+            if current_time < market_start or current_time > market_end:
+                time.sleep(60)
+                continue
+            
+            # 2. Morning setup (9:25 AM)
+            if current_time >= dtime(9, 25) and current_time <= dtime(9, 26):
+                if start_balance is None:
+                    balance = dhan.get_balance()
+                    if balance:
+                        start_balance = balance
+                        send_whatsapp_alert(f"✅ Trading Started | Balance: ₹{balance:,}")
+            
+            # 3. Get current data
+            orders_today = dhan.get_today_orders()
+            positions = dhan.get_positions()
+            
+            # 4. Check order limit (10 orders/day)
+            if orders_today >= 10:
+                send_whatsapp_alert(f"🚫 10/10 Orders Limit Reached!")
+                monitoring_active = False
+                continue
+            
+            # 5. Check loss limit (20%)
+            if start_balance:
+                total_pnl = sum([pos.get('realizedPnl', 0) + pos.get('unrealizedPnl', 0) 
+                               for pos in positions])
+                
+                if total_pnl < 0:
+                    loss_percent = abs(total_pnl) / start_balance
+                    if loss_percent >= 0.20:  # 20%
+                        send_whatsapp_alert(f"🚨 20% Loss Limit Hit! P&L: ₹{total_pnl:,.2f}")
+                        dhan.square_off_all()
+                        monitoring_active = False
+                        continue
+            
+            # 6. EOD Auto Exit (3:25 PM)
+            if current_time >= dtime(15, 25) and current_time <= dtime(15, 26):
+                if positions:
+                    send_whatsapp_alert("⏰ Market Closing - Auto Exit")
+                    dhan.square_off_all()
+            
+            # Sleep for 30 seconds
+            time.sleep(30)
+            
+        except Exception as e:
+            logger.error(f"Monitor error: {e}")
+            time.sleep(60)
 
-# Global Instance
-risk_manager = DhanAutoRiskManager()
-
+# Flask Routes
 @app.route('/')
 def home():
-    return "✅ DHAN Risk Manager is RUNNING on RENDER!"
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>DHAN Risk Manager</title>
+        <meta charset="UTF-8">
+        <style>
+            body { font-family: Arial; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 800px; margin: auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .btn { padding: 10px 20px; margin: 10px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+            .start { background: #4CAF50; color: white; }
+            .stop { background: #f44336; color: white; }
+            .status { padding: 15px; margin: 10px 0; border-radius: 5px; }
+            .active { background: #d4edda; border: 1px solid #c3e6cb; }
+            .inactive { background: #f8d7da; border: 1px solid #f5c6cb; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🛡️ DHAN Risk Manager</h1>
+            <p>Auto risk management for DHAN Demat account</p>
+            
+            <div class="status" id="statusDiv">
+                <h3>Status: <span id="statusText">Loading...</span></h3>
+                <p>Last Check: <span id="lastCheck">-</span></p>
+                <p>Start Balance: <span id="startBalance">-</span></p>
+                <p>Orders Today: <span id="ordersCount">-</span></p>
+            </div>
+            
+            <button class="btn start" onclick="startMonitor()">▶️ Start Monitoring</button>
+            <button class="btn stop" onclick="stopMonitor()">⏹️ Stop Monitoring</button>
+            
+            <hr>
+            
+            <h3>Rules:</h3>
+            <ul>
+                <li>✅ Max 10 orders/day</li>
+                <li>✅ Max 20% loss/day</li>
+                <li>✅ Auto exit at 3:25 PM</li>
+                <li>✅ WhatsApp alerts</li>
+            </ul>
+            
+            <p><a href="/status" target="_blank">API Status</a> | 
+               <a href="/test-alert" target="_blank">Test Alert</a> |
+               <a href="/logs" target="_blank">View Logs</a></p>
+        </div>
+        
+        <script>
+            function updateStatus() {
+                fetch('/api/status')
+                    .then(r => r.json())
+                    .then(data => {
+                        document.getElementById('statusText').innerText = data.monitoring_active ? 'ACTIVE 🔵' : 'INACTIVE 🔴';
+                        document.getElementById('lastCheck').innerText = data.last_check || '-';
+                        document.getElementById('startBalance').innerText = data.start_balance ? '₹' + data.start_balance.toLocaleString() : '-';
+                        document.getElementById('ordersCount').innerText = data.orders_today || '0';
+                        
+                        let statusDiv = document.getElementById('statusDiv');
+                        statusDiv.className = data.monitoring_active ? 'status active' : 'status inactive';
+                    });
+            }
+            
+            function startMonitor() {
+                fetch('/api/start', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => {
+                        alert(data.message || 'Started');
+                        updateStatus();
+                    });
+            }
+            
+            function stopMonitor() {
+                fetch('/api/stop', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => {
+                        alert(data.message || 'Stopped');
+                        updateStatus();
+                    });
+            }
+            
+            // Update every 10 seconds
+            setInterval(updateStatus, 10000);
+            updateStatus();
+        </script>
+    </body>
+    </html>
+    """
 
-@app.route('/status')
-def status():
-    status_info = {
-        "status": "active",
-        "start_balance": risk_manager.start_balance,
-        "orders_today": risk_manager.get_dhan_orders_today(),
-        "trading_blocked": risk_manager.trading_blocked,
-        "last_check": datetime.now().strftime("%H:%M:%S")
-    }
-    return status_info
+@app.route('/api/status')
+def api_status():
+    return jsonify({
+        'monitoring_active': monitoring_active,
+        'start_balance': start_balance,
+        'orders_today': orders_today,
+        'last_check': last_check.strftime('%H:%M:%S') if last_check else None,
+        'server_time': datetime.now().strftime('%H:%M:%S')
+    })
 
-def run_scheduler():
-    """Background Scheduler"""
-    # Morning Balance Capture
-    schedule.every().day.at("09:25").do(risk_manager.morning_routine)
-    
-    # Every 30 Seconds Monitor
-    schedule.every(30).seconds.do(risk_manager.monitor_task)
-    
-    # EOD Exit
-    schedule.every().day.at("14:55").do(lambda: risk_manager.whatsapp_alert("EOD Exit Starting"))
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+@app.route('/api/start', methods=['POST'])
+def start_monitoring():
+    global monitoring_active
+    if not monitoring_active:
+        monitoring_active = True
+        thread = threading.Thread(target=monitor_market, daemon=True)
+        thread.start()
+        return jsonify({'message': 'Monitoring started', 'status': 'active'})
+    return jsonify({'message': 'Already running', 'status': 'active'})
 
-if __name__ == "__main__":
-    # Start Scheduler in Background Thread
-    scheduler_thread = Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    
-    # Start Flask App
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+@app.route('/api/stop', methods=['POST'])
+def stop_monitoring():
+    global monitoring_active
+    monitoring_active = False
+    return jsonify({'message': 'Monitoring stopped', 'status': 'inactive'})
+
+@app.route('/test-alert')
+def test_alert():
+    success = send_whatsapp_alert("✅ Test Alert: System is working!")
+    return jsonify({'success': success, 'message': 'Test alert sent'})
+
+@app.route('/logs')
+def view_logs():
+    return jsonify({
+        'logs': 'View logs in Render dashboard',
+        'url': 'https://dashboard.render.com/'
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"🚀 Starting DHAN Risk Manager on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
