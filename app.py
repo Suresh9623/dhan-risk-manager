@@ -1,6 +1,6 @@
 """
-धन ऑटो रिस्क मॅनेजर - सोपी आवृत्ती
-तुम्ही मोबाईलवर ट्रेड करा, आम्ही बॅकग्राऊंडमध्ये मॉनिटर करू
+धन डिमॅट रिस्क मॅनेजर
+तुमच्या धन डिमॅट अकाउंटसाठी संपूर्ण रिस्क मॅनेजमेंट
 """
 
 import os
@@ -16,47 +16,187 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# धन API
+try:
+    from dhanhq import dhanhq
+    DHAN_AVAILABLE = True
+    logger.info("✅ धन API उपलब्ध")
+except ImportError:
+    DHAN_AVAILABLE = False
+    logger.error("❌ धन API पॅकेज नाही. 'pip install dhanhq' करा")
+
 # ============ कॉन्फिगरेशन ============
 TRADING_START_TIME = datetime.time(9, 25)  # सकाळी 9:25
 TRADING_END_TIME = datetime.time(15, 0)    # दुपारी 3:00
 MAX_DAILY_TRADES = 10
 MAX_LOSS_PERCENTAGE = 20
 
-# ============ स्टेट मॅनेजमेंट ============
-class RiskManager:
+# ============ धन रिस्क मॅनेजर ============
+class DhanRiskManager:
     def __init__(self):
-        self.daily_trades = 0
-        self.initial_capital = 100000
-        self.current_balance = 100000
-        self.current_loss = 0
-        self.running = False
+        self.dhan_client = None
+        self.connected = False
+        self.monitoring = False
         self.blocked = False
         self.block_reason = ""
-        self.last_update = datetime.datetime.now()
+        self.daily_trades = 0
+        self.initial_capital = 0
+        self.current_balance = 0
+        self.total_loss = 0
+        self.positions = []
         
-        logger.info("🤖 रिस्क मॅनेजर सुरू")
-        logger.info(f"📈 ट्रेडिंग वेळ: {TRADING_START_TIME} ते {TRADING_END_TIME}")
-        logger.info(f"🎯 कमाल ट्रेड्स/दिवस: {MAX_DAILY_TRADES}")
-        logger.info(f"⚠️ कमाल तोटा: {MAX_LOSS_PERCENTAGE}%")
+        # धन API कनेक्शन
+        self.connect_to_dhan()
+        
+        logger.info("🛡️ धन डिमॅट रिस्क मॅनेजर सुरू")
+    
+    def connect_to_dhan(self):
+        """धन API सोबत कनेक्ट करा"""
+        if not DHAN_AVAILABLE:
+            logger.error("❌ धन API पॅकेज नाही")
+            return
+            
+        client_id = os.environ.get('DHAN_CLIENT_ID')
+        access_token = os.environ.get('DHAN_ACCESS_TOKEN')
+        
+        if not client_id or not access_token:
+            logger.error("❌ DHAN_CLIENT_ID किंवा DHAN_ACCESS_TOKEN सेट नाही")
+            logger.info("ℹ️ Render Dashboard → Environment → Add:")
+            logger.info("   DHAN_CLIENT_ID = तुमचा_क्लायंट_ID")
+            logger.info("   DHAN_ACCESS_TOKEN = तुमचा_टोकन")
+            return
+        
+        try:
+            logger.info("🔗 धन API सोबत कनेक्ट करत आहे...")
+            self.dhan_client = dhanhq(client_id, access_token)
+            self.connected = True
+            
+            # प्रारंभिक बॅलन्स सेट करा
+            self.refresh_balance()
+            
+            logger.info(f"✅ धन API कनेक्टेड!")
+            logger.info(f"💰 प्रारंभिक बॅलन्स: ₹{self.initial_capital}")
+            
+        except Exception as e:
+            logger.error(f"❌ धन कनेक्शन त्रुटी: {e}")
+    
+    def refresh_balance(self):
+        """बॅलन्स रिफ्रेश करा"""
+        if not self.connected:
+            return False
+            
+        try:
+            funds = self.dhan_client.get_fund_limits()
+            
+            if isinstance(funds, dict):
+                self.current_balance = funds.get('availableBalance', 0)
+                # प्रथम वेळी initial capital सेट करा
+                if self.initial_capital == 0:
+                    self.initial_capital = self.current_balance
+                return True
+                
+            elif isinstance(funds, list) and len(funds) > 0:
+                self.current_balance = funds[0].get('availableBalance', 0)
+                if self.initial_capital == 0:
+                    self.initial_capital = self.current_balance
+                return True
+                
+        except Exception as e:
+            logger.error(f"❌ बॅलन्स फेच त्रुटी: {e}")
+        
+        return False
+    
+    def get_positions(self):
+        """वर्तमान पोझिशन्स"""
+        if not self.connected:
+            return []
+            
+        try:
+            positions = self.dhan_client.get_positions()
+            self.positions = positions if positions else []
+            return self.positions
+        except:
+            return []
+    
+    def calculate_pnl(self):
+        """P&L कॅल्क्युलेट करा"""
+        if not self.connected:
+            return 0, 0
+            
+        total_pnl = 0
+        positions = self.get_positions()
+        
+        for pos in positions:
+            pnl = pos.get('pnl', 0) or pos.get('netReturns', 0)
+            total_pnl += pnl
+        
+        # बॅलन्स तोटा
+        balance_loss = max(0, self.initial_capital - self.current_balance)
+        self.total_loss = abs(total_pnl) + balance_loss
+        
+        # तोटा टक्के
+        if self.initial_capital > 0:
+            loss_percentage = (self.total_loss / self.initial_capital) * 100
+        else:
+            loss_percentage = 0
+            
+        return self.total_loss, loss_percentage
+    
+    def exit_all_positions(self):
+        """सर्व पोझिशन्स बंद करा"""
+        if not self.connected:
+            return False
+            
+        try:
+            positions = self.get_positions()
+            if not positions:
+                return True
+                
+            exited = 0
+            for position in positions:
+                if position.get('quantity', 0) > 0:
+                    try:
+                        self.dhan_client.place_order(
+                            security_id=position.get('securityId'),
+                            exchange_segment=position.get('exchangeSegment', 'NSE_EQ'),
+                            transaction_type="SELL",
+                            quantity=position.get('quantity'),
+                            order_type="MARKET",
+                            product_type=position.get('productType', 'INTRADAY')
+                        )
+                        exited += 1
+                    except:
+                        continue
+            
+            logger.warning(f"🚨 {exited} पोझिशन्स एक्झिट केल्या")
+            return exited > 0
+            
+        except Exception as e:
+            logger.error(f"❌ एक्झिट त्रुटी: {e}")
+            return False
     
     def check_rules(self):
         """सर्व नियम तपासा"""
         violations = []
         
-        # 1. ट्रेडिंग वेळ तपासा
+        # 1. ट्रेडिंग वेळ
         current_time = datetime.datetime.now().time()
         if not (TRADING_START_TIME <= current_time <= TRADING_END_TIME):
             if current_time > TRADING_END_TIME:
                 violations.append("ट्रेडिंग वेळ संपली (3:00 PM)")
+                # ऑटो एक्झिट
+                self.exit_all_positions()
                 self.blocked = True
                 self.block_reason = "3:00 PM नंतर ट्रेडिंग बंद"
             else:
                 violations.append("ट्रेडिंग वेळ सुरू नाही (9:25 AM)")
         
-        # 2. 20% तोटा तपासा
-        loss_percentage = (self.current_loss / self.initial_capital) * 100
+        # 2. 20% तोटा
+        _, loss_percentage = self.calculate_pnl()
         if loss_percentage >= MAX_LOSS_PERCENTAGE:
             violations.append(f"20% तोटा झाला ({loss_percentage:.1f}%)")
+            # ऑटो एक्झिट
+            self.exit_all_positions()
             self.blocked = True
             self.block_reason = "20% तोटा झाला"
         
@@ -68,23 +208,44 @@ class RiskManager:
         
         return violations
     
-    def should_block_trades(self):
-        """ट्रेड्स ब्लॉक करायचे का?"""
-        violations = self.check_rules()
-        return len(violations) > 0, violations
-    
     def start_monitoring(self):
         """मॉनिटरिंग सुरू करा"""
-        self.running = True
+        if not self.connected:
+            logger.error("❌ धन API कनेक्ट नाही")
+            return
+            
+        self.monitoring = True
         logger.info("🔍 मॉनिटरिंग सुरू केले")
+        
+        def monitor():
+            while self.monitoring:
+                try:
+                    # बॅलन्स अपडेट
+                    self.refresh_balance()
+                    
+                    # नियम तपासा
+                    violations = self.check_rules()
+                    if violations:
+                        for violation in violations:
+                            logger.warning(f"⚠️ {violation}")
+                    
+                    time.sleep(30)  # प्रत्येक 30 सेकंदांनी
+                    
+                except Exception as e:
+                    logger.error(f"❌ मॉनिटरिंग त्रुटी: {e}")
+                    time.sleep(60)
+        
+        # बॅकग्राऊंड थ्रेड
+        self.monitor_thread = threading.Thread(target=monitor, daemon=True)
+        self.monitor_thread.start()
     
     def stop_monitoring(self):
         """मॉनिटरिंग थांबवा"""
-        self.running = False
+        self.monitoring = False
         logger.info("⏸️ मॉनिटरिंग थांबवले")
 
 # ग्लोबल इंस्टन्स
-risk_manager = RiskManager()
+dhan_manager = DhanRiskManager()
 
 # ============ HTML टेम्पलेट ============
 HTML_TEMPLATE = '''
@@ -93,125 +254,269 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>धन रिस्क मॅनेजर</title>
+    <title>धन डिमॅट रिस्क मॅनेजर</title>
     <style>
         body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background: #f5f5f5;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
         }
         .container {
-            max-width: 500px;
+            max-width: 800px;
             margin: 0 auto;
             background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
         }
         h1 {
             color: #2c3e50;
             text-align: center;
+            margin-bottom: 10px;
         }
-        .status {
-            padding: 15px;
-            border-radius: 8px;
-            margin: 15px 0;
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+        }
+        .status-card {
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
             text-align: center;
             font-weight: bold;
+            font-size: 1.1em;
         }
-        .status-active {
+        .status-connected {
             background: #d4edda;
             color: #155724;
+            border: 2px solid #28a745;
         }
-        .status-blocked {
+        .status-disconnected {
             background: #f8d7da;
             color: #721c24;
+            border: 2px solid #dc3545;
         }
-        .info-grid {
-            margin: 20px 0;
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        .card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 5px solid #3498db;
+        }
+        .card h3 {
+            color: #2c3e50;
+            margin-top: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
         .info-item {
             display: flex;
             justify-content: space-between;
             padding: 10px 0;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid #dee2e6;
         }
+        .info-label {
+            color: #6c757d;
+        }
+        .info-value {
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .danger { color: #dc3545; }
+        .warning { color: #ffc107; }
+        .success { color: #28a745; }
         .controls {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin: 20px 0;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin: 30px 0;
         }
-        button {
-            padding: 12px;
+        .btn {
+            padding: 15px;
             border: none;
-            border-radius: 6px;
+            border-radius: 8px;
             font-weight: bold;
+            font-size: 1em;
             cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: all 0.3s;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
         }
         .btn-start { background: #28a745; color: white; }
         .btn-stop { background: #dc3545; color: white; }
-        .btn-add { background: #007bff; color: white; }
-        .btn-exit { background: #ffc107; color: black; }
+        .btn-exit { background: #fd7e14; color: white; }
+        .btn-refresh { background: #17a2b8; color: white; }
+        .btn-add { background: #6f42c1; color: white; }
+        .btn-reset { background: #6c757d; color: white; }
         .rules {
-            background: #f8f9fa;
+            background: #e8f4f8;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 30px;
+            border-left: 5px solid #3498db;
+        }
+        .rules h3 {
+            color: #2c3e50;
+            margin-top: 0;
+        }
+        .rule-item {
+            padding: 10px;
+            margin: 10px 0;
+            background: white;
+            border-radius: 8px;
+            border-left: 4px solid #2c3e50;
+        }
+        .alert {
             padding: 15px;
             border-radius: 8px;
-            margin-top: 20px;
+            margin: 20px 0;
+            font-weight: bold;
+            text-align: center;
+        }
+        .alert-danger {
+            background: #f8d7da;
+            color: #721c24;
+            border: 2px solid #dc3545;
+        }
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 2px solid #28a745;
+        }
+        @media (max-width: 768px) {
+            .container { padding: 20px; }
+            .dashboard { grid-template-columns: 1fr; }
+            .controls { grid-template-columns: 1fr; }
         }
     </style>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 </head>
 <body>
     <div class="container">
-        <h1>📱 धन रिस्क मॅनेजर</h1>
+        <h1><i class="fas fa-shield-alt"></i> धन डिमॅट रिस्क मॅनेजर</h1>
+        <p class="subtitle">तुमच्या धन डिमॅट अकाउंटसाठी संपूर्ण रिस्क मॅनेजमेंट</p>
         
-        <div class="status {% if data.blocked %}status-blocked{% else %}status-active{% endif %}">
-            {% if data.blocked %}
-                ❌ {{ data.block_reason }}
+        <!-- कनेक्शन स्टेटस -->
+        <div class="status-card {% if data.connected %}status-connected{% else %}status-disconnected{% endif %}">
+            {% if data.connected %}
+                <i class="fas fa-check-circle"></i> धन API कनेक्टेड
             {% else %}
-                ✅ ट्रेडिंग परवानगी आहे
+                <i class="fas fa-times-circle"></i> धन API डिस्कनेक्टेड
             {% endif %}
         </div>
         
-        <div class="info-grid">
-            <div class="info-item">
-                <span>ट्रेड काउंट:</span>
-                <strong>{{ data.daily_trades }}/{{ data.max_trades }}</strong>
+        <!-- अलर्ट मेसेज -->
+        {% if data.blocked %}
+        <div class="alert alert-danger">
+            <i class="fas fa-exclamation-triangle"></i> {{ data.block_reason }}
+        </div>
+        {% endif %}
+        
+        <!-- डॅशबोर्ड -->
+        <div class="dashboard">
+            <!-- फंड माहिती -->
+            <div class="card">
+                <h3><i class="fas fa-wallet"></i> फंड माहिती</h3>
+                <div class="info-item">
+                    <span class="info-label">बॅलन्स:</span>
+                    <span class="info-value success">₹{{ data.current_balance }}</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">तोटा:</span>
+                    <span class="info-value {% if data.loss_percentage >= 10 %}danger{% else %}warning{% endif %}">
+                        ₹{{ data.total_loss }} ({{ data.loss_percentage }}%)
+                    </span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">एक्सपोजर:</span>
+                    <span class="info-value">{{ data.exposure }}%</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">पोझिशन्स:</span>
+                    <span class="info-value">{{ data.positions_count }}</span>
+                </div>
             </div>
-            <div class="info-item">
-                <span>तोटा:</span>
-                <strong>{{ data.loss_percentage }}%</strong>
-            </div>
-            <div class="info-item">
-                <span>बॅलन्स:</span>
-                <strong>₹{{ data.current_balance }}</strong>
-            </div>
-            <div class="info-item">
-                <span>मॉनिटरिंग:</span>
-                <strong>{{ 'सक्रिय' if data.monitoring_active else 'निष्क्रिय' }}</strong>
-            </div>
-            <div class="info-item">
-                <span>वेळ:</span>
-                <strong>{{ data.current_time }}</strong>
+            
+            <!-- ट्रेडिंग माहिती -->
+            <div class="card">
+                <h3><i class="fas fa-chart-line"></i> ट्रेडिंग माहिती</h3>
+                <div class="info-item">
+                    <span class="info-label">ट्रेड काउंट:</span>
+                    <span class="info-value {% if data.daily_trades >= 8 %}warning{% else %}success{% endif %}">
+                        {{ data.daily_trades }}/{{ data.max_trades }}
+                    </span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">बाकी ट्रेड्स:</span>
+                    <span class="info-value">{{ data.remaining_trades }}</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">मॉनिटरिंग:</span>
+                    <span class="info-value {% if data.monitoring_active %}success{% else %}danger{% endif %}">
+                        {{ 'सक्रिय' if data.monitoring_active else 'निष्क्रिय' }}
+                    </span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">वेळ:</span>
+                    <span class="info-value">{{ data.current_time }}</span>
+                </div>
             </div>
         </div>
         
+        <!-- कंट्रोल बटण्स -->
         <div class="controls">
-            <button class="btn-start" onclick="startMonitoring()">▶️ सुरू करा</button>
-            <button class="btn-stop" onclick="stopMonitoring()">⏸️ थांबवा</button>
-            <button class="btn-add" onclick="addTrade()">📈 ट्रेड जोडा</button>
-            <button class="btn-exit" onclick="resetDaily()">🔄 दिवस रिसेट</button>
+            <button class="btn btn-start" onclick="startMonitoring()">
+                <i class="fas fa-play"></i> मॉनिटरिंग सुरू
+            </button>
+            <button class="btn btn-stop" onclick="stopMonitoring()">
+                <i class="fas fa-pause"></i> मॉनिटरिंग थांबवा
+            </button>
+            <button class="btn btn-exit" onclick="exitAllPositions()">
+                <i class="fas fa-sign-out-alt"></i> सर्व बंद करा
+            </button>
+            <button class="btn btn-refresh" onclick="refreshBalance()">
+                <i class="fas fa-sync-alt"></i> बॅलन्स रिफ्रेश
+            </button>
+            <button class="btn btn-add" onclick="addTrade()">
+                <i class="fas fa-plus-circle"></i> ट्रेड जोडा
+            </button>
+            <button class="btn btn-reset" onclick="resetDaily()">
+                <i class="fas fa-redo"></i> दिवस रिसेट
+            </button>
         </div>
         
+        <!-- नियम -->
         <div class="rules">
-            <h3>📋 मुख्य नियम</h3>
-            <p>1. 20% तोटा → ऑटो एक्झिट</p>
-            <p>2. 9:25 AM ते 3:00 PM → फक्त ट्रेडिंग</p>
-            <p>3. 10 ट्रेड्स/दिवस → नंतर ब्लॉक</p>
+            <h3><i class="fas fa-rules"></i> रिस्क मॅनेजमेंट नियम</h3>
+            <div class="rule-item">
+                <strong><i class="fas fa-exclamation-triangle"></i> नियम 1:</strong> 20% तोटा झाल्यास सर्व पोझिशन्स ऑटो एक्झिट
+            </div>
+            <div class="rule-item">
+                <strong><i class="fas fa-clock"></i> नियम 2:</strong> ट्रेडिंग वेळ: सकाळी 9:25 ते दुपारी 3:00
+            </div>
+            <div class="rule-item">
+                <strong><i class="fas fa-chart-bar"></i> नियम 3:</strong> दिवसात फक्त 10 ट्रेड्स
+            </div>
         </div>
     </div>
     
     <script>
+        // मॉनिटरिंग सुरू
         function startMonitoring() {
             fetch('/api/start', { method: 'POST' })
                 .then(response => response.json())
@@ -221,6 +526,7 @@ HTML_TEMPLATE = '''
                 });
         }
         
+        // मॉनिटरिंग थांबवा
         function stopMonitoring() {
             fetch('/api/stop', { method: 'POST' })
                 .then(response => response.json())
@@ -230,6 +536,29 @@ HTML_TEMPLATE = '''
                 });
         }
         
+        // सर्व पोझिशन्स बंद
+        function exitAllPositions() {
+            if(confirm('सर्व पोझिशन्स बंद करायच्या?')) {
+                fetch('/api/exit_all', { method: 'POST' })
+                    .then(response => response.json())
+                    .then(data => {
+                        alert(data.message);
+                        location.reload();
+                    });
+            }
+        }
+        
+        // बॅलन्स रिफ्रेश
+        function refreshBalance() {
+            fetch('/api/refresh_balance', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message);
+                    location.reload();
+                });
+        }
+        
+        // ट्रेड जोडा
         function addTrade() {
             fetch('/api/add_trade', { method: 'POST' })
                 .then(response => response.json())
@@ -239,6 +568,7 @@ HTML_TEMPLATE = '''
                 });
         }
         
+        // दिवस रिसेट
         function resetDaily() {
             if(confirm('दिवसाचा काउंटर रिसेट करायचा?')) {
                 fetch('/api/reset_daily', { method: 'POST' })
@@ -250,10 +580,10 @@ HTML_TEMPLATE = '''
             }
         }
         
-        // ऑटो रिफ्रेश (प्रत्येक 30 सेकंदांनी)
+        // ऑटो रिफ्रेश (प्रत्येक 60 सेकंदांनी)
         setInterval(() => {
             location.reload();
-        }, 30000);
+        }, 60000);
     </script>
 </body>
 </html>
@@ -262,19 +592,31 @@ HTML_TEMPLATE = '''
 # ============ API रूट्स ============
 @app.route('/')
 def home():
-    """मुख्य पृष्ठ"""
-    should_block, violations = risk_manager.should_block_trades()
-    loss_percentage = (risk_manager.current_loss / risk_manager.initial_capital) * 100
+    """मुख्य डॅशबोर्ड"""
+    # बॅलन्स रिफ्रेश
+    dhan_manager.refresh_balance()
+    
+    # P&L कॅल्क्युलेट
+    total_loss, loss_percentage = dhan_manager.calculate_pnl()
+    
+    # नियम तपासा
+    violations = dhan_manager.check_rules()
     
     data = {
-        "blocked": risk_manager.blocked,
-        "block_reason": risk_manager.block_reason,
-        "daily_trades": risk_manager.daily_trades,
-        "max_trades": MAX_DAILY_TRADES,
+        "connected": dhan_manager.connected,
+        "blocked": dhan_manager.blocked,
+        "block_reason": dhan_manager.block_reason,
+        "current_balance": dhan_manager.current_balance,
+        "total_loss": total_loss,
         "loss_percentage": round(loss_percentage, 1),
-        "current_balance": risk_manager.current_balance,
-        "monitoring_active": risk_manager.running,
-        "current_time": datetime.datetime.now().strftime("%H:%M:%S")
+        "exposure": round((total_loss / dhan_manager.initial_capital) * 100, 1) if dhan_manager.initial_capital > 0 else 0,
+        "daily_trades": dhan_manager.daily_trades,
+        "max_trades": MAX_DAILY_TRADES,
+        "remaining_trades": MAX_DAILY_TRADES - dhan_manager.daily_trades,
+        "positions_count": len(dhan_manager.positions),
+        "monitoring_active": dhan_manager.monitoring,
+        "current_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "violations": violations
     }
     
     return render_template_string(HTML_TEMPLATE, data=data)
@@ -282,44 +624,79 @@ def home():
 @app.route('/api/start', methods=['POST'])
 def api_start():
     """मॉनिटरिंग सुरू करा"""
-    risk_manager.start_monitoring()
+    if not dhan_manager.connected:
+        return jsonify({
+            "status": "error",
+            "message": "धन API कनेक्ट नाही"
+        }), 400
+    
+    dhan_manager.start_monitoring()
     return jsonify({
         "status": "success",
-        "message": "मॉनिटरिंग सुरू केले"
+        "message": "मॉनिटरिंग सुरू केले",
+        "check_interval": "प्रत्येक 30 सेकंदांनी"
     })
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
     """मॉनिटरिंग थांबवा"""
-    risk_manager.stop_monitoring()
+    dhan_manager.stop_monitoring()
     return jsonify({
         "status": "success",
         "message": "मॉनिटरिंग थांबवले"
     })
 
+@app.route('/api/exit_all', methods=['POST'])
+def api_exit_all():
+    """सर्व पोझिशन्स बंद करा"""
+    if not dhan_manager.connected:
+        return jsonify({
+            "status": "error",
+            "message": "धन API कनेक्ट नाही"
+        }), 400
+    
+    success = dhan_manager.exit_all_positions()
+    
+    return jsonify({
+        "status": "success" if success else "error",
+        "message": "सर्व पोझिशन्स बंद करण्याची कमांड दिली" if success else "त्रुटी झाली"
+    })
+
+@app.route('/api/refresh_balance', methods=['POST'])
+def api_refresh_balance():
+    """बॅलन्स रिफ्रेश करा"""
+    success = dhan_manager.refresh_balance()
+    
+    return jsonify({
+        "status": "success" if success else "error",
+        "message": "बॅलन्स रिफ्रेश केला" if success else "बॅलन्स रिफ्रेश अयशस्वी",
+        "current_balance": dhan_manager.current_balance
+    })
+
 @app.route('/api/add_trade', methods=['POST'])
 def api_add_trade():
     """ट्रेड जोडा"""
-    risk_manager.daily_trades += 1
+    dhan_manager.daily_trades += 1
     
     # 10 ट्रेड्स झाल्यास ब्लॉक
-    if risk_manager.daily_trades >= MAX_DAILY_TRADES:
-        risk_manager.blocked = True
-        risk_manager.block_reason = f"{MAX_DAILY_TRADES} ट्रेड्स झाल्या"
+    if dhan_manager.daily_trades >= MAX_DAILY_TRADES:
+        dhan_manager.blocked = True
+        dhan_manager.block_reason = f"{MAX_DAILY_TRADES} ट्रेड्स झाल्या"
     
     return jsonify({
         "status": "success",
-        "daily_trades": risk_manager.daily_trades,
+        "daily_trades": dhan_manager.daily_trades,
         "max_trades": MAX_DAILY_TRADES,
-        "blocked": risk_manager.blocked
+        "remaining_trades": MAX_DAILY_TRADES - dhan_manager.daily_trades,
+        "blocked": dhan_manager.blocked
     })
 
 @app.route('/api/reset_daily', methods=['POST'])
 def api_reset_daily():
     """दिवसाचा काउंटर रिसेट करा"""
-    risk_manager.daily_trades = 0
-    risk_manager.blocked = False
-    risk_manager.block_reason = ""
+    dhan_manager.daily_trades = 0
+    dhan_manager.blocked = False
+    dhan_manager.block_reason = ""
     
     return jsonify({
         "status": "success",
@@ -327,45 +704,37 @@ def api_reset_daily():
         "daily_trades": 0
     })
 
-@app.route('/api/update_loss', methods=['POST'])
-def api_update_loss():
-    """तोटा अपडेट करा"""
-    try:
-        data = request.get_json()
-        loss = float(data.get('loss', 0))
-        
-        risk_manager.current_loss = loss
-        
-        # 20% तोटा तपासा
-        loss_percentage = (loss / risk_manager.initial_capital) * 100
-        if loss_percentage >= MAX_LOSS_PERCENTAGE:
-            risk_manager.blocked = True
-            risk_manager.block_reason = "20% तोटा झाला"
-        
-        return jsonify({
-            "status": "success",
-            "loss": loss,
-            "loss_percentage": f"{loss_percentage:.1f}%",
-            "blocked": risk_manager.blocked
-        })
-    except:
-        return jsonify({"error": "Invalid data"}), 400
-
 @app.route('/api/status', methods=['GET'])
 def api_status():
     """स्टेटस मिळवा"""
-    should_block, violations = risk_manager.should_block_trades()
-    loss_percentage = (risk_manager.current_loss / risk_manager.initial_capital) * 100
+    violations = dhan_manager.check_rules()
+    total_loss, loss_percentage = dhan_manager.calculate_pnl()
     
     return jsonify({
-        "monitoring_active": risk_manager.running,
-        "blocked": risk_manager.blocked,
-        "block_reason": risk_manager.block_reason,
-        "daily_trades": risk_manager.daily_trades,
-        "remaining_trades": MAX_DAILY_TRADES - risk_manager.daily_trades,
+        "connected": dhan_manager.connected,
+        "monitoring_active": dhan_manager.monitoring,
+        "blocked": dhan_manager.blocked,
+        "block_reason": dhan_manager.block_reason,
+        "daily_trades": dhan_manager.daily_trades,
+        "remaining_trades": MAX_DAILY_TRADES - dhan_manager.daily_trades,
+        "current_balance": dhan_manager.current_balance,
+        "initial_capital": dhan_manager.initial_capital,
+        "total_loss": total_loss,
         "loss_percentage": f"{loss_percentage:.1f}%",
-        "current_balance": risk_manager.current_balance,
+        "positions_count": len(dhan_manager.positions),
         "violations": violations,
+        "timestamp": datetime.datetime.now().isoformat()
+    })
+
+@app.route('/api/positions', methods=['GET'])
+def api_positions():
+    """वर्तमान पोझिशन्स"""
+    positions = dhan_manager.get_positions()
+    
+    return jsonify({
+        "status": "success",
+        "positions": positions,
+        "count": len(positions),
         "timestamp": datetime.datetime.now().isoformat()
     })
 
@@ -374,13 +743,14 @@ def health():
     """हेल्थ चेक"""
     return jsonify({
         "status": "healthy",
-        "app": "धन रिस्क मॅनेजर",
-        "version": "1.0",
+        "app": "धन डिमॅट रिस्क मॅनेजर",
+        "dhan_connected": dhan_manager.connected,
+        "monitoring_active": dhan_manager.monitoring,
         "timestamp": datetime.datetime.now().isoformat()
     })
 
 # ============ सर्व्हर स्टार्ट ============
 if __name__ == '__main__':
-    logger.info("🚀 धन रिस्क मॅनेजर सुरू करत आहे...")
+    logger.info("🚀 धन डिमॅट रिस्क मॅनेजर सुरू करत आहे...")
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
