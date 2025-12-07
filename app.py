@@ -377,7 +377,7 @@ def background_monitor():
 monitor_thread = threading.Thread(target=background_monitor, daemon=True)
 monitor_thread.start()
 
-# ============ HTML टेम्पलेट ============
+# ============ HTML टेम्पलेट (दुरुस्त केलेला) ============
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="mr">
@@ -605,7 +605,8 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="info-item">
                         <span class="info-label">तोटा %:</span>
-                        <span class="info-value {{ 'warning' if data.loss_percentage >= 10 else 'good' }}">
+                        {% set loss_percent_num = data.loss_percentage|float %}
+                        <span class="info-value {{ 'bad' if loss_percent_num >= 20 else ('warning' if loss_percent_num >= 10 else 'good') }}">
                             {{ data.loss_percentage }}%
                         </span>
                     </div>
@@ -639,7 +640,8 @@ HTML_TEMPLATE = """
                 <div class="info-grid">
                     <div class="info-item">
                         <span class="info-label">आजचे ट्रेड्स:</span>
-                        <span class="info-value {{ 'warning' if data.daily_trades >= 8 else 'good' }}">
+                        {% set trades_num = data.daily_trades|int %}
+                        <span class="info-value {{ 'bad' if trades_num >= 10 else ('warning' if trades_num >= 8 else 'good') }}">
                             {{ data.daily_trades }}
                         </span>
                     </div>
@@ -772,23 +774,23 @@ def home():
     can_trade, trade_message = can_place_trade()
     loss_percentage = calculate_loss_percentage()
     
-    # डेटा तयार करा
+    # डेटा तयार करा - सर्व संख्यात्मक मूल्ये सुनिश्चित करा
     data = {
         "trading_enabled": trading_state.trading_enabled,
         "trading_hours_active": is_trading_time(),
         "can_trade": can_trade,
         "trade_message": trade_message,
         "current_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "available_balance": trading_state.total_capital,
-        "current_loss": trading_state.current_loss,
-        "current_profit": trading_state.current_profit,
-        "net_balance": trading_state.total_capital - trading_state.current_loss,
-        "loss_percentage": f"{loss_percentage:.2f}",
+        "available_balance": float(trading_state.total_capital),
+        "current_loss": float(trading_state.current_loss),
+        "current_profit": float(trading_state.current_profit),
+        "net_balance": float(trading_state.total_capital - trading_state.current_loss),
+        "loss_percentage": f"{loss_percentage:.2f}",  # टेम्पलेटमध्ये float मध्ये रूपांतरित केले जाईल
         "dhan_connected": trading_state.dhan_client is not None,
         "last_balance_update": trading_state.last_balance_update.strftime("%H:%M:%S") if trading_state.last_balance_update else "कधीच नाही",
-        "daily_trades": trading_state.daily_trade_count,
-        "remaining_trades": MAX_DAILY_TRADES - trading_state.daily_trade_count,
-        "max_trades": MAX_DAILY_TRADES,
+        "daily_trades": int(trading_state.daily_trade_count),
+        "remaining_trades": int(MAX_DAILY_TRADES - trading_state.daily_trade_count),
+        "max_trades": int(MAX_DAILY_TRADES),
         "positions_count": len(trading_state.positions),
         "date": trading_state.last_reset_date.strftime("%d-%m-%Y")
     }
