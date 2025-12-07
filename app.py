@@ -4,7 +4,7 @@ import pytz
 from flask import Flask, jsonify
 
 # -------------------------
-# CONFIG FROM ENV - तुमच्या सर्व CONDITIONS इथे आहेत!
+# CONFIG FROM ENV - ⭐ तुझे नवीन LIMITS इथे ⭐
 # -------------------------
 CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "")
 ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
@@ -13,9 +13,11 @@ BASE_URL = os.getenv("DHAN_BASE_URL", "https://api.dhan.co")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# तुमचे CONDITIONS इथे आहेत! ⭐⭐⭐
-MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "20"))
-MAX_LOSS_PERCENT = float(os.getenv("MAX_LOSS_PERCENT", "0.25"))
+# ⭐⭐⭐ तुझे नवीन LIMITS ⭐⭐⭐
+MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "10"))      # 10 orders/day
+MAX_LOSS_PERCENT = float(os.getenv("MAX_LOSS_PERCENT", "0.20"))     # 20% loss limit
+# ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
+
 TRADING_START = dtime(int(os.getenv("TR_START_H", "9")), int(os.getenv("TR_START_M", "25")))
 TRADING_END = dtime(int(os.getenv("TR_END_H", "15")), int(os.getenv("TR_END_M", "0")))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))
@@ -29,7 +31,7 @@ HEADERS = {
 }
 
 # -------------------------
-# Flask app + health
+# Flask app
 # -------------------------
 app = Flask(__name__)
 monitor_thread = None
@@ -45,9 +47,6 @@ def is_trading_time():
     t = now_time()
     return TRADING_START <= t <= TRADING_END
 
-# -------------------------
-# State persistence
-# -------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -69,9 +68,6 @@ def save_state(st):
     with open(STATE_FILE, "w") as f:
         json.dump(st, f)
 
-# -------------------------
-# Telegram helper
-# -------------------------
 def send_telegram(msg):
     try:
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -80,9 +76,6 @@ def send_telegram(msg):
     except Exception:
         pass
 
-# -------------------------
-# Dhan API wrappers
-# -------------------------
 def get_fund_details():
     try:
         resp = requests.get(f"{BASE_URL}/funds", headers=HEADERS, timeout=10)
@@ -141,9 +134,6 @@ def place_exit_order_for_position(p):
         print("place_exit_order error:", e)
         return False
 
-# -------------------------
-# Emergency functions - LIMITS HIT झाल्यास हे CALL होतं!
-# -------------------------
 def cancel_all_orders():
     orders = get_pending_orders()
     for o in orders:
@@ -176,9 +166,6 @@ def emergency_exit_and_block(state, reason):
     state["blocked_reason"] = reason
     save_state(state)
 
-# -------------------------
-# Monitoring loop - यात सर्व CONDITIONS CHECK होतात!
-# -------------------------
 def monitor_loop():
     global stop_signal
     print("Monitor thread started")
@@ -188,7 +175,6 @@ def monitor_loop():
         try:
             state = load_state()
             
-            # Daily reset - मध्यरात्री automatic reset
             if state["date"] != current_date_str():
                 state = {
                     "date": current_date_str(),
@@ -203,50 +189,46 @@ def monitor_loop():
                 time.sleep(2)
                 continue
 
-            # Morning balance capture - सकाळी 9:25 ला
             if state["morning_balance"] is None and is_trading_time():
                 fb = get_fund_details()
                 if fb is not None and fb > 0:
                     state["morning_balance"] = fb
-                    state["max_loss_amount"] = fb * MAX_LOSS_PERCENT
+                    # ⭐ 20% loss limit calculation ⭐
+                    state["max_loss_amount"] = fb * MAX_LOSS_PERCENT  # fb * 0.20
                     save_state(state)
-                    send_telegram(f"🌅 Morning balance: ₹{fb:.2f} | Max loss: ₹{state['max_loss_amount']:.2f}")
+                    send_telegram(f"🌅 Morning balance: ₹{fb:.2f} | Max loss (20%): ₹{state['max_loss_amount']:.2f}")
                 else:
                     print("Waiting for fund details...")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Trading hours check - 3:00 PM नंतर BLOCK
             if not is_trading_time():
                 if state["trading_allowed"]:
                     emergency_exit_and_block(state, "⏰ Trading hours ended")
                 time.sleep(30)
                 continue
 
-            # Current balance check
             cur_bal = get_fund_details()
             if cur_bal is None:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # LOSS LIMIT CHECK - 25% condition इथे आहे! ⭐
             if state["morning_balance"]:
                 loss_amount = state["morning_balance"] - cur_bal
                 print(f"[{datetime.now(TIMEZONE)}] Orders={state['order_count']} Morning={state['morning_balance']:.2f} Current={cur_bal:.2f} Loss={loss_amount:.2f}")
 
-                # 25% LOSS LIMIT HIT - emergency exit
+                # ⭐ 20% LOSS LIMIT CHECK ⭐
                 if state["trading_allowed"] and loss_amount >= state["max_loss_amount"]:
-                    emergency_exit_and_block(state, f"📉 Loss limit hit: ₹{loss_amount:.2f} >= ₹{state['max_loss_amount']:.2f}")
+                    emergency_exit_and_block(state, f"📉 20% Loss limit hit: ₹{loss_amount:.2f} >= ₹{state['max_loss_amount']:.2f}")
                     time.sleep(2)
                     continue
 
-                # ORDER LIMIT CHECK - 20 orders/day condition इथे आहे! ⭐
+                # ⭐ 10 ORDERS/DAY LIMIT CHECK ⭐
                 if state["trading_allowed"] and state["order_count"] >= MAX_ORDERS_PER_DAY:
-                    emergency_exit_and_block(state, f"🔢 Order limit: {state['order_count']} >= {MAX_ORDERS_PER_DAY}")
+                    emergency_exit_and_block(state, f"🔢 10 Orders limit: {state['order_count']} >= {MAX_ORDERS_PER_DAY}")
                     time.sleep(2)
                     continue
 
-            # Safety: if trading blocked, cancel pending orders
             if not state["trading_allowed"]:
                 cancel_all_orders()
                 
@@ -257,9 +239,6 @@ def monitor_loop():
             send_telegram(f"⚠️ Monitor error: {str(e)}")
             time.sleep(10)
 
-# -------------------------
-# Routes
-# -------------------------
 @app.route("/")
 def index():
     st = load_state()
@@ -268,8 +247,8 @@ def index():
         "is_trading_time": is_trading_time(),
         "trading_start": TRADING_START.strftime("%H:%M"),
         "trading_end": TRADING_END.strftime("%H:%M"),
-        "max_orders": MAX_ORDERS_PER_DAY,
-        "max_loss_percent": MAX_LOSS_PERCENT,
+        "max_orders": MAX_ORDERS_PER_DAY,        # 10
+        "max_loss_percent": MAX_LOSS_PERCENT,    # 0.20 (20%)
         "monitor_status": "running" if not stop_signal else "stopped"
     })
     return jsonify(st)
@@ -316,9 +295,6 @@ def emergency_exit():
     emergency_exit_and_block(state, "🆘 Manual emergency exit")
     return jsonify({"status": "emergency_exit_executed"})
 
-# -------------------------
-# Start background thread on boot
-# -------------------------
 if __name__ == "__main__":
     t = threading.Thread(target=monitor_loop, daemon=True)
     t.start()
